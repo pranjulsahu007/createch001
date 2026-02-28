@@ -4,6 +4,8 @@ import os
 import math
 import matplotlib
 import matplotlib.pyplot as plt
+from datetime import datetime
+
 
 matplotlib.rcParams.update({
     'font.family':      'DejaVu Sans',
@@ -26,6 +28,13 @@ from inventory_simulator    import simulate_timeline, plot_inventory_timeline
 from procurement_scheduler  import generate_procurement_schedule
 from revit_importer         import load_revit_file, auto_map_columns, convert_revit_to_smartform
 from dxf_parser             import get_layers, parse_dxf, EZDXF_OK
+from project_library        import (save_project, list_projects, load_project_df,
+                                    delete_project, get_training_dataframe)
+from estimator              import (train as train_estimator, estimate,
+                                    generate_elements_from_estimate, SKLEARN_OK)
+from kitting_engine         import (assign_kits, kit_summary as compute_kit_summary,
+                                    standardization_score, export_to_excel,
+                                    export_kitting_plan_excel)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -77,13 +86,15 @@ def kpi_card(title, value, sub, accent="#1565C0", sub_color="#2E7D32"):
 
 def section_header(num, title, subtitle=""):
     sub_html = f"<p style='font-size:13px;color:#6B7280;margin:2px 0 14px;'>{subtitle}</p>" if subtitle else "<div style='margin-bottom:14px;'></div>"
+    num_str  = str(num).zfill(2) if str(num).isdigit() else str(num)
     return f"""
     <div style='margin-top:8px;'>
       <div style='font-size:10px;font-weight:700;letter-spacing:1.5px;
-                  text-transform:uppercase;color:#9CA3AF;margin-bottom:2px;'>{num:02d}</div>
+                  text-transform:uppercase;color:#9CA3AF;margin-bottom:2px;'>{num_str}</div>
       <h3 style='margin:0;font-size:20px;font-weight:800;color:#1A1A2E;'>{title}</h3>
       {sub_html}
     </div>"""
+
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -370,8 +381,243 @@ if _source_label:
     st.caption(_source_label)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PROJECT LIBRARY + QUICK ESTIMATE (ML)
+# ══════════════════════════════════════════════════════════════════════════════
+with st.expander("🗂 Project Library & 🤖 Quick Estimate  ─  click to expand", expanded=False):
+    lib_tab, est_tab = st.tabs(["📚 Project Library", "⚡ Quick Estimate"])
+
+    # ── Project Library tab ─────────────────────────────────────────────────
+    with lib_tab:
+        st.markdown(
+            "Save past project data here to train the estimator. "
+            "The more projects you add, the smarter Quick Estimate becomes."
+        )
+
+        # Show existing library
+        lib_df = list_projects()
+        if lib_df.empty:
+            st.info("No projects saved yet. Add the current project below, or upload a past project.")
+        else:
+            st.dataframe(lib_df.drop(columns=['ID'], errors='ignore'),
+                         use_container_width=True, hide_index=True)
+            col_del, col_ret = st.columns([2, 1])
+            del_id = col_del.selectbox("Select project to load or delete",
+                                        lib_df['ID'].tolist() if 'ID' in lib_df.columns
+                                        else lib_df.index.tolist(),
+                                        key="lib_sel",
+                                        format_func=lambda x: lib_df.set_index('ID').loc[x, 'Name']
+                                        if 'ID' in lib_df.columns else x)
+            c1, c2 = st.columns(2)
+            if c1.button("📂 Load this project into dashboard", key="lib_load"):
+                loaded = load_project_df(del_id)
+                loaded['_source'] = 'Library'
+                st.session_state['imported_df'] = loaded
+                st.success("Project loaded into dashboard. Scroll down for results.")
+                st.rerun()
+            if c2.button("🗑 Delete this project", key="lib_del"):
+                delete_project(del_id)
+                st.success("Project deleted.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("**➕ Add project to library**")
+
+        # Toggle: use current data or upload a separate CSV
+        lib_source = st.radio(
+            "Data source for this library entry",
+            ["📊 Use currently loaded dashboard data",
+             "📁 Upload a past project CSV file"],
+            horizontal=True, key="lib_source_mode"
+        )
+
+        past_csv_df = None
+        if lib_source.startswith("📁"):
+            past_file = st.file_uploader(
+                "Upload past project structural_elements.csv",
+                type=['csv'], key="lib_past_csv"
+            )
+            if past_file:
+                past_csv_df = pd.read_csv(past_file)
+                past_csv_df.columns = [c.strip() for c in past_csv_df.columns]
+                st.success(f"Loaded {len(past_csv_df)} elements from uploaded file.")
+                st.dataframe(past_csv_df.head(5), use_container_width=True, hide_index=True)
+
+        # Determine which DataFrame to save
+        df_to_save = past_csv_df if lib_source.startswith("📁") else df_elements
+
+        if df_to_save is not None:
+            with st.form("save_project_form"):
+                sc = st.columns(3)
+                proj_name = sc[0].text_input("Project Name", placeholder="Tower A — Phase 1")
+                btype     = sc[1].selectbox("Building Type",
+                                            ['Residential','Commercial','Industrial','Mixed-Use','Parking'])
+                city      = sc[2].text_input("City / Location", placeholder="Mumbai")
+                sc2 = st.columns(3)
+                p_floors  = sc2[0].number_input(
+                    "Floors",
+                    value=int(df_to_save['Floor'].max()) if 'Floor' in df_to_save.columns else 10,
+                    min_value=1
+                )
+                p_area    = sc2[1].number_input("Floor plate area (m²)", value=500.0, step=10.0)
+                p_dur     = sc2[2].number_input("Project duration (days)", value=90, step=5)
+                p_notes   = st.text_area("Notes (optional)", height=60)
+
+                submitted = st.form_submit_button("💾 Save to Library", type="primary")
+                if submitted:
+                    if not proj_name.strip():
+                        st.error("Please enter a project name.")
+                    else:
+                        pid = save_project(
+                            name=proj_name, building_type=btype, city=city,
+                            floors=p_floors, floor_area_m2=p_area, duration_days=p_dur,
+                            df_elements=df_to_save, notes=p_notes
+                        )
+                        result = train_estimator()
+                        ok = 'error' not in result
+                        if ok:
+                            st.success(f"✅ Saved & model retrained on {result['n_samples']} project(s). "
+                                       f"Accuracy: ~{result['score']}%")
+                        else:
+                            st.success(f"✅ Project saved. {result.get('error','')}")
+                        st.rerun()
+        else:
+            if lib_source.startswith("📊"):
+                st.info("Load data first via the Data Import tabs above, or switch to 'Upload a past project CSV'.")
+            else:
+                st.info("Upload a past project CSV file above to continue.")
+
+
+        # Manual model retrain button
+        if not lib_df.empty:
+            if st.button("🔄 Retrain estimator model now", key="retrain_btn"):
+                r = train_estimator(force=True)
+                if 'error' in r:
+                    st.warning(f"Could not train: {r['error']}")
+                else:
+                    st.success(f"Model retrained on {r['n_samples']} projects. Approx accuracy: {r['score']}%")
+
+    # ── Quick Estimate tab ──────────────────────────────────────────────────
+    with est_tab:
+        if not SKLEARN_OK:
+            st.warning("scikit-learn not installed. Estimates will use built-in AEC norms instead of ML.")
+
+        st.markdown(
+            "Enter basic project specs below. SmartForm AI will **estimate the full element list**, "
+            "run BoQ + optimisation, and show projected formwork cost.\n\n"
+            "🔑 **Training only works from real CSVs uploaded in the Project Library tab** — "
+            "the more diverse projects you add, the smarter this becomes."
+        )
+
+        lib_size = len(list_projects())
+        if lib_size == 0:
+            st.info("💡 No training data yet — using built-in AEC construction norms. "
+                    "Upload real past-project CSVs to the Library tab.")
+        else:
+            st.success(f"🤖 Model trained on **{lib_size} project(s)** from your library.")
+
+        with st.form("quick_estimate_form"):
+            qc = st.columns(3)
+            q_btype  = qc[0].selectbox("Building Type",
+                                        ['Residential','Commercial','Industrial','Mixed-Use','Parking'])
+            q_floors = qc[1].number_input("Number of Floors", value=10, min_value=1, max_value=100)
+            q_area   = qc[2].number_input("Floor Plate Area (m²)", value=500.0, step=50.0)
+            qc2 = st.columns(3)
+            q_dur    = qc2[0].number_input("Project Duration (days)", value=90, step=5)
+            q_start  = qc2[1].text_input("Start Date (YYYY-MM-DD)",
+                                          value=datetime.today().strftime('%Y-%m-%d'))
+            q_zones  = qc2[2].text_input("Zones (comma-separated)", value="Zone-A,Zone-B")
+
+            # Area-based cost
+            q_rate = st.slider("Formwork cost rate (₹ per m² of contact area)",
+                               min_value=150, max_value=800, value=350, step=25,
+                               help="Typical: ₹250–400/m² for ply/steel combo. "
+                                    "This replaces the old flat cost/set inputs.")
+
+            run_est = st.form_submit_button("⚡ Generate Estimate & Run Optimisation", type="primary")
+
+        if run_est:
+            zone_list = [z.strip() for z in q_zones.split(',') if z.strip()] or ['Zone-A']
+
+            with st.spinner("Estimating project scope…"):
+                est = estimate(q_btype, q_floors, q_area, q_dur)
+
+            # Display estimate summary
+            st.markdown("**📊 Estimated Scope**")
+            est_cols = st.columns(5)
+            est_cols[0].metric("Columns",  est['n_columns'])
+            est_cols[1].metric("Slabs",    est['n_slabs'])
+            est_cols[2].metric("Beams",    est['n_beams'])
+            est_cols[3].metric("Total",    est['n_columns'] + est['n_slabs'] + est['n_beams'])
+            est_cols[4].metric("Clusters", est.get('n_clusters', '—'))
+            st.caption(f"Source: {est.get('source','')}")
+
+            # Dimension table
+            dim_data = {
+                'Type':   ['Column', 'Slab', 'Beam'],
+                'Length': [round(est['col_length'],3), round(est['slab_length'],3), round(est['beam_length'],3)],
+                'Width':  [round(est['col_width'],3),  round(est['slab_width'],3),  round(est['beam_width'],3)],
+                'Height': [round(est['col_height'],3), round(est['slab_height'],3), round(est['beam_height'],3)],
+            }
+            dm = pd.DataFrame(dim_data)
+            # Add formwork area and cost columns
+            from estimator import _formwork_area
+            dm['Formwork Area (m²)'] = dm.apply(
+                lambda r: round(_formwork_area(r['Type'], r['Length'], r['Width'], r['Height']), 2), axis=1)
+            dm['Cost/Element (₹)'] = (dm['Formwork Area (m²)'] * q_rate).round(0).astype(int)
+            st.dataframe(dm, use_container_width=False, hide_index=True)
+
+            # Show cluster profiles if available
+            cprof = est.get('cluster_profiles')
+            if cprof and any(cprof.values()):
+                with st.expander("📐 Learned Dimension Clusters (from training CSVs)"):
+                    for etype, clusters in cprof.items():
+                        if clusters:
+                            st.markdown(f"**{etype}** — {len(clusters)} unique sizes learned")
+                            st.dataframe(
+                                pd.DataFrame(clusters).rename(columns={
+                                    'L':'Length', 'W':'Width', 'H':'Height', 'count':'Historical Count'
+                                }),
+                                use_container_width=False, hide_index=True
+                            )
+
+            # Generate full element list
+            est_elements = generate_elements_from_estimate(
+                est, building_type=q_btype, floors=q_floors,
+                start_date=q_start, duration_days=q_dur,
+                zone_names=zone_list,
+                formwork_rate_per_m2=float(q_rate),
+            )
+
+            # Feed into dashboard
+            est_elements['_source'] = 'Estimate'
+            st.session_state['imported_df'] = est_elements
+            est_elements_show = est_elements.drop(columns=['_source'], errors='ignore')
+
+            st.markdown("**🗂 Generated Element List** (preview — first 15 rows)")
+            st.dataframe(est_elements_show.head(15), use_container_width=True, hide_index=True)
+
+            dl_col, _ = st.columns([1, 2])
+            dl_col.download_button(
+                "⬇ Download as structural_elements.csv",
+                data=est_elements_show.to_csv(index=False),
+                file_name="structural_elements_estimated.csv",
+                mime="text/csv"
+            )
+            st.success(
+                f"✅ {len(est_elements)} elements generated "
+                f"({est.get('n_clusters','?')} clusters) at ₹{q_rate}/m². "
+                "Scroll down for full BoQ, optimisation & procurement."
+            )
+
+        if run_est:
+            st.rerun()
+
+
+
 
 # ── Active feature badges ─────────────────────────────────────────────────────
+
 badges = []
 badges.append(f"⏱ Cycle: {reuse_cycle}d ({curing_days}+{stripping_days}+{handling_days})")
 if enable_life_limit:
@@ -599,8 +845,253 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTION 03.5 — Formwork Kitting Plan
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown(section_header("03.5", "Formwork Kitting Plan",
+                           "Which physical elements share which formwork kit · greedy reuse assignment"),
+            unsafe_allow_html=True)
+
+# ── Standardization Score card ────────────────────────────────────────────────
+std = standardization_score(df_clustered)
+sc_col1, sc_col2 = st.columns([1, 2])
+with sc_col1:
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1A1A2E,#16213E);
+                border-radius:14px;padding:24px 28px;text-align:center;">
+      <div style="font-size:11px;font-weight:700;letter-spacing:1.5px;
+                  text-transform:uppercase;color:#7986CB;margin-bottom:6px;">
+        Standardization Score
+      </div>
+      <div style="font-size:52px;font-weight:900;color:{std['colour']};line-height:1;">
+        {std['score']}
+      </div>
+      <div style="font-size:14px;font-weight:700;color:#FFFFFF;margin-top:4px;">
+        {std['grade']}
+      </div>
+      <div style="font-size:11px;color:#9FA8DA;margin-top:8px;">
+        Higher = more standardized = cheaper formwork
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+with sc_col2:
+    d = std['details']
+    st.markdown("**What this score means for your project:**")
+    std_tbl = pd.DataFrame({
+        'Metric': ['Total Elements','Unique Clusters','Avg Elements per Cluster',
+                   'Repetition Ratio','Element Types'],
+        'Value':  [d['total_elements'], d['unique_clusters'], d['avg_cluster_size'],
+                   f"{d['repetition_ratio']:.1f}%", d['type_variety']],
+        'Impact': [
+            'Larger = more data for optimization',
+            'Fewer = better (fewer unique templates needed)',
+            'Higher = more reuses per kit → lower cost',
+            f"{'Excellent' if d['repetition_ratio']>70 else 'Good' if d['repetition_ratio']>50 else 'Improve design standardization'}",
+            'Column + Slab + Beam = good structural variety',
+        ]
+    })
+    st.dataframe(std_tbl, use_container_width=True, hide_index=True)
+
+st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
+
+# ── Run kitting assignment ─────────────────────────────────────────────────────
+with st.spinner("Running kitting assignment…"):
+    df_kitted    = assign_kits(df_clustered, reuse_cycle_days=reuse_cycle)
+    df_kit_summ  = compute_kit_summary(df_kitted)
+
+kit_col_a, kit_col_b = st.columns([1, 1], gap="large")
+
+with kit_col_a:
+    st.markdown("**📦 Kit Assignment Table** — every element mapped to a kit")
+    kit_display = df_kitted[[
+        c for c in ['Element_ID','Type','Cluster_ID','Kit_ID','Kit_Number',
+                    'Casting_Date','Reuse_Count','Days_Since_Prev']
+        if c in df_kitted.columns
+    ]].rename(columns={
+        'Kit_Number': 'Kit No.', 'Reuse_Count': 'Reuse #', 'Days_Since_Prev': 'Gap (d)'
+    })
+    st.dataframe(kit_display, use_container_width=True, hide_index=True, height=300)
+
+with kit_col_b:
+    st.markdown("**📊 Kit Utilization Summary**")
+    summ_display = df_kit_summ[[
+        c for c in ['Kit_ID','Type','Total_Uses','First_Use','Last_Use',
+                    'Active_Days','Reuse_Efficiency_%']
+        if c in df_kit_summ.columns
+    ]].rename(columns={
+        'Total_Uses': 'Uses', 'Active_Days': 'Active d',
+        'Reuse_Efficiency_%': 'Efficiency %'
+    })
+    st.dataframe(
+        summ_display.style.background_gradient(subset=['Efficiency %'], cmap='YlGn'),
+        use_container_width=True, hide_index=True, height=300
+    )
+
+# ── Kit reuse bar chart ───────────────────────────────────────────────────────
+st.markdown("**🔁 Kit reuse frequency** — each bar = one physical formwork kit")
+top_kits = df_kit_summ.nlargest(min(20, len(df_kit_summ)), 'Total_Uses')
+fig_kit, ax_k = plt.subplots(figsize=(12, max(3, len(top_kits) * 0.38)))
+colours_k = ['#1565C0' if r >= 5 else '#42A5F5' if r >= 3 else '#90CAF9'
+             for r in top_kits['Total_Uses']]
+bars_k = ax_k.barh(top_kits['Kit_ID'][::-1], top_kits['Total_Uses'][::-1],
+                   color=colours_k[::-1], height=0.55, edgecolor='none')
+for bar, val in zip(bars_k, top_kits['Total_Uses'][::-1]):
+    ax_k.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height() / 2,
+              f"{val}×", va='center', fontsize=9, color='#444')
+ax_k.set_xlabel("Number of Reuses", fontsize=10)
+ax_k.set_title("Formwork Kit Reuse Frequency (Top 20 Kits)", fontsize=12,
+               fontweight='bold', color='#1A1A2E', pad=10)
+ax_k.spines[['top', 'right', 'left']].set_visible(False)
+ax_k.tick_params(left=False)
+plt.tight_layout()
+st.pyplot(fig_kit)
+
+# ── Kitting Plan Excel download ───────────────────────────────────────────────
+kit_dl_col, kit_info_col = st.columns([1, 3])
+with kit_dl_col:
+    if st.button("📥 Download Kitting Plan Excel", type="primary",
+                 use_container_width=True, key="kit_dl_btn"):
+        with st.spinner("Building workbook…"):
+            kb = export_kitting_plan_excel(
+                df_kitted=df_kitted,
+                df_kit_summ=df_kit_summ,
+                reuse_cycle_days=reuse_cycle,
+                project_name="SmartForm AI Project",
+            )
+            st.session_state['kit_excel'] = kb
+    if st.session_state.get('kit_excel'):
+        st.download_button(
+            "⬇ Save Kitting Plan.xlsx",
+            data=st.session_state['kit_excel'],
+            file_name="Formwork_Kitting_Plan.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="kit_dl_save"
+        )
+with kit_info_col:
+    st.markdown(
+        "**4 sheets:** README (instructions) · "
+        "**Chronological Flow** (every pour in date order, Frame → Element ID) · "
+        "**Frame Register** (dispatch log per kit, colour-coded FIRST USE / REUSE) · "
+        "**Kit Summary** (efficiency stats)"
+    )
+
+st.divider()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 03.6 — Cost Waterfall & Savings Breakdown
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown(section_header("03.6", "Cost Savings Waterfall",
+                           "Visual proof of measurable reduction in material and carrying costs"),
+            unsafe_allow_html=True)
+
+wf_labels  = ['Baseline\n(No Reuse)', 'Formwork\nReuse Savings', 'Carrying\nCost Saved',
+              'Write-off\nCost' if enable_life_limit else '', 'Net\nOptimised Cost']
+wf_labels  = [l for l in wf_labels if l]
+
+baseline   = naive_cost
+after_reuse = opt_cost
+carry_save  = carry_savings
+wo_cost     = write_off_total if enable_life_limit else 0
+net_cost    = true_total_cost
+
+wf_values  = [baseline, -(baseline - after_reuse), -carry_save]
+wf_colours = ['#475569', '#16A34A', '#22C55E']
+if enable_life_limit:
+    wf_values.append(wo_cost)
+    wf_colours.append('#DC2626')
+wf_values.append(net_cost)
+wf_colours.append('#1565C0')
+
+wf_starts  = [0]
+running    = baseline
+for v in wf_values[1:-1]:
+    running += v
+    wf_starts.append(running if v < 0 else running - v)
+wf_starts.append(0)   # final bar starts from 0
+
+wf_labels_clean = ['Baseline\n(No Reuse)', 'Reuse\nSavings', 'Carrying\nSaved']
+if enable_life_limit: wf_labels_clean.append('Write-off\nCost')
+wf_labels_clean.append('Net\nOptimised')
+
+fig_wf, ax_wf = plt.subplots(figsize=(10, 5))
+for i, (start, val, col, lbl) in enumerate(zip(wf_starts, wf_values, wf_colours, wf_labels_clean)):
+    ax_wf.bar(lbl, abs(val), bottom=start if i not in (0, len(wf_values)-1) else 0,
+              color=col, width=0.5, edgecolor='white', linewidth=1.5)
+    ax_wf.text(i, (start if val > 0 or i == len(wf_values)-1 else start + abs(val))
+                  + abs(val) / 2,
+               f'₹{abs(val)/1e5:.1f}L', ha='center', va='center',
+               fontsize=9, fontweight='bold', color='white')
+
+ax_wf.set_ylabel("Formwork Cost (₹)", fontsize=10)
+ax_wf.set_title("Cost Waterfall — SmartForm AI Optimisation Impact",
+                fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
+ax_wf.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+st.pyplot(fig_wf)
+
+# Savings summary strip
+wf_s1, wf_s2, wf_s3 = st.columns(3)
+wf_s1.metric("Procurement Savings", f"₹{proc_savings:,.0f}", f"-{proc_red_pct:.1f}% vs baseline")
+wf_s2.metric("Carrying Cost Relief", f"₹{carry_savings:,.0f}", f"@ {carrying_cost_rate*100:.0f}% rate")
+wf_s3.metric("Total Benefit",
+             f"₹{(total_savings - wo_cost):,.0f}",
+             f"{excess_red_pct:.1f}% fewer sets procured")
+
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL EXPORT — one-click full report
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown(
+    "<div style='font-size:10px;font-weight:700;letter-spacing:1.5px;"
+    "text-transform:uppercase;color:#9CA3AF;margin-bottom:8px;'>Export</div>",
+    unsafe_allow_html=True
+)
+ex_col1, ex_col2 = st.columns([1, 3])
+with ex_col1:
+    if st.button("📥 Generate Excel Report", type="primary", use_container_width=True):
+        with st.spinner("Building Excel workbook…"):
+            try:
+                df_proc_export = generate_procurement_schedule(
+                    df_opt, df_clustered, lead_time_days=lead_time_days)
+                excel_bytes = export_to_excel(
+                    df_elements=df_elements,
+                    df_boq=df_clustered,
+                    df_kitted=df_kitted,
+                    df_kit_summary=df_kit_summ,
+                    df_opt=df_opt,
+                    df_proc=df_proc_export,
+                    std_score=std,
+                    project_name="SmartForm AI"
+                )
+                st.session_state['excel_report'] = excel_bytes
+                st.success("Report ready — click download below.")
+            except Exception as e:
+                st.error(f"Export error: {e}")
+    if st.session_state.get('excel_report'):
+        st.download_button(
+            "⬇ Download Excel Report",
+            data=st.session_state['excel_report'],
+            file_name="SmartForm_AI_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+with ex_col2:
+    st.markdown(
+        "**Sheets included:** Summary · Structural Elements · BoQ · "
+        "**Kitting Plan** · Kit Summary · Optimisation Results · Procurement Schedule"
+    )
+
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SECTION 04 — Procurement Schedule  (Feature 4)
 # ══════════════════════════════════════════════════════════════════════════════
+
 st.markdown(section_header(4, "Procurement Schedule",
                            f"Order-by dates based on {lead_time_days}-day supplier lead time"),
             unsafe_allow_html=True)
@@ -634,22 +1125,56 @@ proc_display_show = proc_display[[c for c in [
     'Order_By_Date':   'Order By',
     'Days_Until_Order':'Days Left',
     'Estimated_Cost':  'Est. Cost (₹)',
-})
+}).copy()
 
-def _color_status(val):
-    if 'URGENT' in str(val):   return 'color: #B91C1C; font-weight:700'
-    if 'ORDER SOON' in str(val): return 'color: #B45309; font-weight:700'
-    return 'color: #166534; font-weight:600'
+# ── Purchased tracking ─────────────────────────────────────────────────────────
+if 'proc_purchased' not in st.session_state:
+    st.session_state['proc_purchased'] = {}
 
-st.dataframe(
-    proc_display_show.style
-        .applymap(_color_status, subset=['Status'])
-        .format({'Est. Cost (₹)': '₹{:,.0f}'})
-        .set_properties(**{'font-size': '13px'}),
+# Inject Purchased column from session state
+proc_display_show.insert(0, '✅ Purchased',
+    proc_display_show['Cluster'].map(
+        lambda c: st.session_state['proc_purchased'].get(c, False)
+    )
+)
+
+st.markdown("**Tick ✅ to mark an order as placed — tracked dynamically**")
+
+edited = st.data_editor(
+    proc_display_show,
     use_container_width=True,
     hide_index=True,
-    height=320
+    height=min(360, 36 + 35 * len(proc_display_show)),
+    column_config={
+        '✅ Purchased': st.column_config.CheckboxColumn(
+            "Purchased", help="Tick when you have placed this order", width="small"
+        ),
+        'Est. Cost (₹)': st.column_config.NumberColumn(format="₹%.0f"),
+        'Days Left':     st.column_config.NumberColumn(
+            help="Negative = overdue", width="small"
+        ),
+        'Status': st.column_config.TextColumn(width="medium"),
+    },
+    disabled=[c for c in proc_display_show.columns if c != '✅ Purchased'],
+    key="proc_editor"
 )
+
+# Persist checkbox state
+for _, row in edited.iterrows():
+    st.session_state['proc_purchased'][row['Cluster']] = row['✅ Purchased']
+
+# Live tracking summary
+n_purchased  = edited['✅ Purchased'].sum()
+n_total      = len(edited)
+cost_done    = edited.loc[edited['✅ Purchased'], 'Est. Cost (₹)'].sum()
+cost_pending = edited.loc[~edited['✅ Purchased'], 'Est. Cost (₹)'].sum()
+
+tk1, tk2, tk3, tk4 = st.columns(4)
+tk1.metric("Orders Placed",   f"{n_purchased} / {n_total}")
+tk2.metric("Orders Remaining", n_total - n_purchased)
+tk3.metric("Cost Committed",  f"₹{cost_done:,.0f}")
+tk4.metric("Cost Pending",    f"₹{cost_pending:,.0f}")
+
 
 # Procurement Gantt-style chart
 st.markdown("**Order → Delivery → First Pour timeline**")

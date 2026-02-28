@@ -116,7 +116,7 @@ def _extract_cluster_profiles() -> dict:
         registry = json.load(f)
 
     for proj in registry:
-        csv_path = os.path.join(LIBRARY_DIR, proj['id'], 'structural_elements.csv')
+        csv_path = os.path.join(LIBRARY_DIR, proj['project_id'], 'structural_elements.csv')
         if not os.path.exists(csv_path):
             continue
         try:

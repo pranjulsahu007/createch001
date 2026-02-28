@@ -284,10 +284,20 @@ def estimate(
     X_new[0, 0] = pkg['le'].transform([bt])[0]
 
     Y_pred = pkg['model'].predict(X_new)[0]
-    result = {col: max(0, float(Y_pred[i])) for i, col in enumerate(TARGET_COLS)}
+    # Handle old models trained on fewer targets than current TARGET_COLS
+    result = {}
+    for i, col in enumerate(TARGET_COLS):
+        if i < len(Y_pred):
+            result[col] = max(0, float(Y_pred[i]))
+        else:
+            # Fallback for new targets not in old model
+            result[col] = 0
     # Round counts to integers
     for k in ('n_columns', 'n_slabs', 'n_beams', 'n_clusters'):
-        result[k] = max(1, round(result[k]))
+        result[k] = max(1, round(result.get(k, 1)))
+    # If n_clusters wasn't predicted, derive from counts
+    if result['n_clusters'] <= 1:
+        result['n_clusters'] = result['n_columns'] // 2 + result['n_slabs'] + result['n_beams'] // 2
     result['source'] = f"ML model ({pkg['n_samples']} training projects)"
     result['cluster_profiles'] = pkg.get('cluster_profiles')
     return result

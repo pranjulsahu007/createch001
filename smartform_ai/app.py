@@ -490,12 +490,44 @@ with st.expander("🗂 Project Library & 🤖 Quick Estimate  ─  click to expa
 
         # Manual model retrain button
         if not lib_df.empty:
-            if st.button("🔄 Retrain estimator model now", key="retrain_btn"):
+            st.markdown("---")
+            rc1, rc2 = st.columns([1, 3])
+            with rc1:
+                retrain_clicked = st.button("🧠 Retrain Model", key="retrain_btn",
+                                            type="primary", use_container_width=True)
+            with rc2:
+                st.caption("Retrains on ALL project CSVs in the library. "
+                           "Extracts dimension clusters from real data so Quick Estimate "
+                           "generates varied element sizes — not just 3 flat averages.")
+            if retrain_clicked:
+                # Delete stale model so fresh training uses new cluster code
+                import os as _os
+                from estimator import MODEL_PATH, CLUSTER_PATH
+                for fp in (MODEL_PATH, CLUSTER_PATH):
+                    if _os.path.exists(fp):
+                        _os.remove(fp)
                 r = train_estimator(force=True)
                 if 'error' in r:
                     st.warning(f"Could not train: {r['error']}")
                 else:
-                    st.success(f"Model retrained on {r['n_samples']} projects. Approx accuracy: {r['score']}%")
+                    st.success(f"✅ Model retrained on {r['n_samples']} projects. "
+                               f"Approx accuracy: {r['score']}%")
+                    cprof = r.get('cluster_profiles', {})
+                    total_clusters = sum(len(v) for v in cprof.values())
+                    st.info(f"📐 Extracted **{total_clusters} unique dimension clusters** "
+                            f"from your library CSVs.")
+                    if total_clusters:
+                        with st.expander("View learned dimension clusters"):
+                            for etype, clusters in cprof.items():
+                                if clusters:
+                                    st.markdown(f"**{etype}** — {len(clusters)} sizes")
+                                    st.dataframe(
+                                        pd.DataFrame(clusters).rename(columns={
+                                            'L':'Length', 'W':'Width', 'H':'Height',
+                                            'count':'Historical Count'
+                                        }),
+                                        use_container_width=False, hide_index=True
+                                    )
 
     # ── Quick Estimate tab ──────────────────────────────────────────────────
     with est_tab:

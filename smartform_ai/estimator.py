@@ -159,7 +159,7 @@ def _extract_cluster_profiles() -> dict:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def _encode_features(df: pd.DataFrame, le: LabelEncoder = None):
+def _encode_features(df: pd.DataFrame, le: "LabelEncoder" = None):
     """Convert building_type to int, return (X, le)."""
     df = df.copy()
     if le is None:

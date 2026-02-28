@@ -1,76 +1,133 @@
 import pandas as pd
+import math
 import pulp
 
-def optimize_formwork_sets(df_elements, reuse_cycle_days=7):
+def optimize_formwork_sets(
+    df_elements,
+    reuse_cycle_days=7,
+    max_reuse_count=-1,          # Feature 1: -1 = unlimited
+    zone_col=None                 # Feature 2: None = no zone splitting
+):
     """
-    Minimizes the number of formwork sets required per cluster using PuLP.
-    Constraints: 
-    - Formwork reuse cycle restricts availability.
-    - Must satisfy casting schedule (daily demand).
+    Minimises the number of formwork sets required per cluster (and optionally
+    per zone) using PuLP Integer Linear Programming.
+
+    Parameters
+    ----------
+    df_elements      : pd.DataFrame  Clustered element data.
+    reuse_cycle_days : int           Days a set is locked after a pour (curing + stripping + handling).
+    max_reuse_count  : int           Feature 1 — Max times a set can be reused before write-off.
+                                     -1 = unlimited (original behaviour).
+    zone_col         : str | None    Feature 2 — Column name holding zone labels.
+                                     None = treat entire project as one zone.
+
+    Returns
+    -------
+    pd.DataFrame with one row per (Cluster, Zone) containing:
+        Cluster_ID, Zone, Required_Sets, Naive_Sets,
+        Optimized_Procurement_Cost, Naive_Procurement_Cost,
+        Cost_Savings, Cost_Reduction_%,
+        Sets_Written_Off, Write_Off_Cost, True_Total_Cost   (Feature 1)
     """
     df = df_elements.copy()
-    df['Casting_Date'] = pd.to_datetime(df['Casting_Date'])
-    
-    # Group by cluster and date to get daily pours
-    daily_demand = df.groupby(['Cluster_ID', 'Casting_Date']).size().reset_index(name='Daily_Pours')
-    
+    df['Casting_Date'] = pd.to_datetime(df.get('Casting_Date', pd.NaT))
+
+    # ── Feature 2: build the grouping key ────────────────────────────────────
+    if zone_col and zone_col in df.columns:
+        df['_zone'] = df[zone_col].fillna('Default').astype(str)
+    else:
+        df['_zone'] = 'All'
+
+    group_keys = ['Cluster_ID', '_zone']
+
+    # Daily demand per (cluster, zone, date)
+    daily_demand = (
+        df.groupby(group_keys + ['Casting_Date'])
+          .size()
+          .reset_index(name='Daily_Pours')
+    )
+
     results = []
-    
-    for cluster, group in daily_demand.groupby('Cluster_ID'):
+
+    for (cluster, zone), group in daily_demand.groupby(group_keys):
         min_date = group['Casting_Date'].min()
         max_date = group['Casting_Date'].max()
-        
-        # Create full date series for this cluster's active period
+
         all_dates = pd.date_range(start=min_date, end=max_date)
-        cluster_series = group.set_index('Casting_Date')['Daily_Pours'].reindex(all_dates, fill_value=0)
-        
+        cluster_series = (
+            group.set_index('Casting_Date')['Daily_Pours']
+                 .reindex(all_dates, fill_value=0)
+        )
         pours_array = cluster_series.values
-        days_count = len(pours_array)
-        
-        # --- PuLP Optimization ---
+        days_count  = len(pours_array)
+        total_pours = int(pours_array.sum())
+
+        # ── Feature 1: life-limit lower bound ────────────────────────────────
+        # If max_reuse_count is set, we need at least ceil(total_pours / max_reuse_count) sets
+        life_limit_lb = (
+            math.ceil(total_pours / max_reuse_count)
+            if max_reuse_count > 0 else 0
+        )
+
+        # ── PuLP LP ──────────────────────────────────────────────────────────
         try:
-            prob = pulp.LpProblem(f"Minimize_Sets_{cluster}", pulp.LpMinimize)
-            
-            # Z is the max sets needed concurrently for this cluster
-            Z = pulp.LpVariable("Required_Sets", lowBound=0, cat='Integer')
-            prob += Z, "Objective_Minimize_Sets"
-            
-            # Constraints: for each day, the active sets in the reuse window must be <= Z
+            prob = pulp.LpProblem(f"Sets_{cluster}_{zone}", pulp.LpMinimize)
+            Z = pulp.LpVariable("Required_Sets", lowBound=max(0, life_limit_lb), cat='Integer')
+            prob += Z
+
             for i in range(days_count):
-                start_window = max(0, i - reuse_cycle_days + 1)
-                active_sum = sum(pours_array[start_window:i+1])
-                prob += Z >= active_sum, f"Capacity_Day_{i}"
-                
-            # Solve LP - try to suppress output by catching print streams if needed, msg=0/False manages most.
+                window_start = max(0, i - reuse_cycle_days + 1)
+                active_sum   = int(sum(pours_array[window_start:i + 1]))
+                prob += Z >= active_sum, f"Cap_Day_{i}"
+
+            # Feature 1 explicit constraint (also enforced via lowBound, belt-and-braces)
+            if life_limit_lb > 0:
+                prob += Z >= life_limit_lb, "Life_Limit_LB"
+
             prob.solve(pulp.PULP_CBC_CMD(msg=False))
-            opt_sets = int(pulp.value(Z)) if pulp.LpStatus[prob.status] == 'Optimal' else 0
+            opt_sets = (
+                int(pulp.value(Z))
+                if pulp.LpStatus[prob.status] == 'Optimal' else life_limit_lb
+            )
         except Exception:
-            # Fallback simple iterative approach if PuLP fails
-            opt_sets = 0
+            # Pure-Python sliding-window fallback
+            opt_sets = life_limit_lb
             for i in range(days_count):
-                start_window = max(0, i - reuse_cycle_days + 1)
-                active_sum = sum(pours_array[start_window:i+1])
-                if active_sum > opt_sets:
-                    opt_sets = active_sum
-        
-        # Naive approach: buy 1 set for each max daily pour * 2, or simply the sum of all pours (worst case no reuse)
-        naive_sets = sum(pours_array) 
-        
-        # Cost Calculation
-        cost_per_set = df[df['Cluster_ID'] == cluster]['Formwork_Cost_per_Set'].iloc[0]
-        
-        opt_cost = opt_sets * cost_per_set
+                window_start = max(0, i - reuse_cycle_days + 1)
+                opt_sets = max(opt_sets, int(sum(pours_array[window_start:i + 1])))
+
+        naive_sets = total_pours  # worst case: buy new set for every pour
+
+        # Cost per set for this (cluster, zone) slice
+        mask = (df['Cluster_ID'] == cluster) & (df['_zone'] == zone)
+        cost_per_set = df.loc[mask, 'Formwork_Cost_per_Set'].iloc[0]
+
+        # ── Feature 1: write-off cost ─────────────────────────────────────────
+        if max_reuse_count > 0:
+            sets_written_off = math.floor(total_pours / max_reuse_count)
+        else:
+            sets_written_off = 0
+
+        replacement_cost = df.loc[mask, 'Replacement_Cost_per_Set'].iloc[0] \
+            if 'Replacement_Cost_per_Set' in df.columns else cost_per_set
+        write_off_cost = sets_written_off * replacement_cost
+
+        opt_cost   = opt_sets   * cost_per_set
         naive_cost = naive_sets * cost_per_set
-        
+
         results.append({
-            'Cluster_ID': cluster,
-            'Required_Sets': opt_sets,
-            'Naive_Sets': naive_sets,
-            'Optimized_Procurement_Cost': opt_cost,
-            'Naive_Procurement_Cost': naive_cost,
-            'Cost_Savings': naive_cost - opt_cost,
-            'Cost_Reduction_%': ((naive_cost - opt_cost) / naive_cost * 100) if naive_cost > 0 else 0
+            'Cluster_ID':                  cluster,
+            'Zone':                        zone,
+            'Required_Sets':               opt_sets,
+            'Naive_Sets':                  naive_sets,
+            'Optimized_Procurement_Cost':  opt_cost,
+            'Naive_Procurement_Cost':      naive_cost,
+            'Cost_Savings':                naive_cost - opt_cost,
+            'Cost_Reduction_%':            ((naive_cost - opt_cost) / naive_cost * 100) if naive_cost > 0 else 0,
+            # Feature 1 extras
+            'Sets_Written_Off':            sets_written_off,
+            'Write_Off_Cost':              write_off_cost,
+            'True_Total_Cost':             opt_cost + write_off_cost,
         })
-        
-    df_results = pd.DataFrame(results)
-    return df_results
+
+    return pd.DataFrame(results)

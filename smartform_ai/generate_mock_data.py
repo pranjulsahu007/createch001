@@ -7,14 +7,14 @@ import os
 def create_mock_data(output_dir="."):
     np.random.seed(42)
     random.seed(42)
-    
-    types = ['Column', 'Slab', 'Beam']
-    start_date = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-    
+
+    types  = ['Column', 'Slab', 'Beam']
+    zones  = ['Zone-A', 'Zone-B', 'Zone-C']
+    start  = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+
     elements = []
-    
-    # Generate structural elements
-    for i in range(1, 401): # Generating 400 for realistic spread
+
+    for i in range(1, 401):
         t = random.choice(types)
         if t == 'Column':
             l, w, h = random.choice([(0.5, 0.5, 3.0), (0.6, 0.6, 3.0), (0.4, 0.4, 3.0), (0.8, 0.8, 3.5)])
@@ -25,42 +25,45 @@ def create_mock_data(output_dir="."):
         else:
             l, w, h = random.choice([(5.0, 0.3, 0.5), (4.0, 0.3, 0.5), (6.0, 0.4, 0.6), (7.0, 0.5, 0.7)])
             cost = 1800
-            
-        floor = random.randint(1, 15)
-        # Spread pours heavily over 45 days to create overlapping concurrent demand
-        cast_date = start_date + timedelta(days=random.randint(0, 45))
-        
+
+        floor     = random.randint(1, 15)
+        cast_date = start + timedelta(days=random.randint(0, 45))
+        zone      = random.choice(zones)
+
         elements.append({
-            'Element_ID': f"E-{i:03d}",
-            'Type': t,
-            'Length': l,
-            'Width': w,
-            'Height': h,
-            'Floor': floor,
-            'Casting_Date': cast_date.strftime("%Y-%m-%d"),
-            'Formwork_Cost_per_Set': cost
+            'Element_ID':             f"E-{i:03d}",
+            'Type':                   t,
+            'Length':                 l,
+            'Width':                  w,
+            'Height':                 h,
+            'Floor':                  floor,
+            'Zone':                   zone,                   # Feature 2
+            'Casting_Date':           cast_date.strftime('%Y-%m-%d'),
+            'Formwork_Cost_per_Set':  cost,
+            'Replacement_Cost_per_Set': round(cost * 0.85, 0),  # Feature 1: replacement usually cheaper
+            'Max_Reuse_Count':        10,                     # Feature 1 hint column (informational)
         })
-        
-    df_elements = pd.DataFrame(elements)
-    
-    # Ensure realistic scenarios by duplicating some high-recurring elements
-    highly_repeated = df_elements.sample(100, replace=True)
-    df_elements = pd.concat([df_elements, highly_repeated], ignore_index=True)
-    
-    # Re-sort Element IDs
-    df_elements['Element_ID'] = [f"E-{i:03d}" for i in range(1, len(df_elements) + 1)]
-    
-    # Save elements
-    elements_path = os.path.join(output_dir, 'structural_elements.csv')
-    df_elements.to_csv(elements_path, index=False)
-    
-    # Generate schedule.csv as daily summary mapping
-    df_schedule = df_elements.groupby('Casting_Date')['Element_ID'].apply(lambda x: ', '.join(x)).reset_index()
-    df_schedule.rename(columns={'Element_ID': 'Elements_Planned', 'Casting_Date': 'Date'}, inplace=True)
-    schedule_path = os.path.join(output_dir, 'schedule.csv')
-    df_schedule.to_csv(schedule_path, index=False)
-    
-    print(f"Mock data configured for UI testing at: {output_dir}")
+
+    df = pd.DataFrame(elements)
+
+    # Add 100 duplicated high-repeat rows to simulate real clustering density
+    highfreq = df.sample(100, replace=True)
+    df = pd.concat([df, highfreq], ignore_index=True)
+    df['Element_ID'] = [f"E-{i:03d}" for i in range(1, len(df) + 1)]
+
+    df.to_csv(os.path.join(output_dir, 'structural_elements.csv'), index=False)
+
+    # schedule.csv
+    sched = (
+        df.groupby('Casting_Date')['Element_ID']
+          .apply(lambda x: ', '.join(x))
+          .reset_index()
+          .rename(columns={'Element_ID': 'Elements_Planned', 'Casting_Date': 'Date'})
+    )
+    sched.to_csv(os.path.join(output_dir, 'schedule.csv'), index=False)
+
+    print(f"Mock data written to: {output_dir}")
+    print(f"  structural_elements.csv — {len(df)} rows, zones: {zones}")
 
 if __name__ == "__main__":
     create_mock_data()
